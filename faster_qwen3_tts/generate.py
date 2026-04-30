@@ -173,7 +173,11 @@ def fast_generate(
             full_codebook_token_ids[:4] = codebook_token_ids
             full_codebook_token_ids[4:] = ref_upper[nearest]
             codebook_token_ids = full_codebook_token_ids
-        
+        else:
+    # no ref — pad remaining with zeros (shouldn't happen in clone mode)
+            full_codebook_token_ids = torch.zeros(15, dtype=torch.long, device=device)
+            full_codebook_token_ids[:4] = codebook_token_ids
+            codebook_token_ids = full_codebook_token_ids
         # Build full codec: [first_cb, cb1, ..., cb15]
         all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]
         all_codec_ids.append(all_cb.detach())

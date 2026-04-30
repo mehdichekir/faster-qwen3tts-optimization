@@ -29,6 +29,7 @@ def fast_generate(
     top_p: float = 1.0,
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
+    ref_codes: Optional[torch.Tensor] = None, 
     subtalker_dosample: Optional[bool] = None,
     subtalker_top_k: Optional[int] = None,
     subtalker_top_p: Optional[float] = None,
@@ -143,17 +144,33 @@ def fast_generate(
     t_prefill = time.time() - t_start
     
     # === DECODE LOOP ===
+    ref_upper = None
+    if ref_codes is not None:
+        # upper codes are columns 5 through 15 (index 4 to 14 in the 15-code predictor output)
+        # ref_codes[:,0] is codebook 1 (the token), ref_codes[:,1:] are the 15 predictor codes
+        ref_cb1 = ref_codes[:, 1].to(device)   # first predictor code per ref frame
+        ref_upper = ref_codes[:, 5:].to(device) # codes 5-15, shape [num_ref_frames, 11]
     t_decode_start = time.time()
     all_codec_ids = []
     
-    for step_idx in range(max_new_tokens):
-        if token.item() == eos_id:
-            break
-        
-        # --- CUDA-Graphed Code Predictor ---
-        last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [1, 1, H]
-        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)  # [1, 2, H]
-        codebook_token_ids = predictor_graph.run(pred_input)  # [15] long tensor
+for step_idx in range(max_new_tokens):
+    if token.item() == eos_id:
+        break
+    
+    # --- CUDA-Graphed Code Predictor ---
+    # --- CUDA-Graphed Code Predictor (partial) ---
+    last_id_hidden = talker_codec_embed(token.unsqueeze(1))
+    pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+    codebook_token_ids = predictor_graph.run(pred_input)  # [15] full run for now
+
+    if ref_upper is not None:
+        # find nearest ref frame by matching codebook 1
+        pred_cb1 = codebook_token_ids[0]
+        dists = (ref_cb1 - pred_cb1).abs()
+        nearest = dists.argmin()
+        # steal upper codes 5-15 from that ref frame
+        codebook_token_ids = codebook_token_ids.clone()
+        codebook_token_ids[4:] = ref_upper[nearest]
         
         # Build full codec: [first_cb, cb1, ..., cb15]
         all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]

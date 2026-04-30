@@ -143,61 +143,93 @@ def fast_generate(
     t_prefill = time.time() - t_start
     
     # === DECODE LOOP ===
+# === DECODE LOOP ===
     t_decode_start = time.time()
     all_codec_ids = []
-    
+
+    stream_talker = torch.cuda.Stream()
+    stream_predictor = torch.cuda.Stream()
+
+    # events for synchronization between streams
+    pred_ready = torch.cuda.Event()
+    talker_ready = torch.cuda.Event()
+
+    # prime the pipeline — run predictor for frame 0 on its stream
+    # so it's ready when talker finishes frame 0
+    last_id_hidden = talker_codec_embed(token.unsqueeze(1))
+    pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+
+    with torch.cuda.stream(stream_predictor):
+        codebook_token_ids = predictor_graph.run(pred_input)
+        pred_ready.record(stream_predictor)
+
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
             break
-        
-        # --- CUDA-Graphed Code Predictor ---
-        last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [1, 1, H]
-        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)  # [1, 2, H]
-        codebook_token_ids = predictor_graph.run(pred_input)  # [15] long tensor
-        
-        # Build full codec: [first_cb, cb1, ..., cb15]
-        all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]
+
+        current_pos = prefill_len + step_idx
+        if current_pos >= talker_graph.max_seq_len - 1:
+            break
+
+        # wait for predictor to finish before building embed
+        torch.cuda.current_stream().wait_event(pred_ready)
+
+        # snapshot codebook tokens — predictor buffer will be reused next iteration
+        current_codebook_ids = codebook_token_ids.clone()
+
+        # build full codec for this frame
+        all_cb = torch.cat([token.view(1), current_codebook_ids])
         all_codec_ids.append(all_cb.detach())
-        
-        # --- Build input embedding for talker ---
+
+        # build input embedding for talker
         codec_hiddens = [last_id_hidden]
         for i in range(num_code_groups - 1):
-            codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
+            codec_hiddens.append(predictor_codec_embeds[i](current_codebook_ids[i].unsqueeze(0).unsqueeze(0)))
         inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
-        
+
         if gen_step < trailing_text_hiddens.shape[1]:
             inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
-        
-        # --- CUDA-Graphed Talker decode step ---
-        current_pos = prefill_len + step_idx
-        if current_pos >= talker_graph.max_seq_len - 1:
-            # Stop if we exceed max_seq_len
-            break
-        
-        hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
-        # hidden_states is the static output buffer - use it immediately
-        
-        logits = talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
-        
-        if repetition_penalty != 1.0 and len(all_codec_ids) > 0:
-            history = torch.stack([c[0] for c in all_codec_ids])
-            logits = apply_repetition_penalty(logits, history, repetition_penalty)
 
-        suppress_eos = len(all_codec_ids) < min_new_tokens
-        token = sample_logits(
-            logits.squeeze(0),
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            suppress_mask=suppress_mask,
-            suppress_tokens=[eos_id] if suppress_eos else None,
-        )
-        past_hidden = hidden_states[:, -1:, :].clone()  # clone since it's the static buffer
+        # run talker on stream_talker
+        with torch.cuda.stream(stream_talker):
+            hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
+            logits = talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
+
+            if repetition_penalty != 1.0 and len(all_codec_ids) > 0:
+                history = torch.stack([c[0] for c in all_codec_ids])
+                logits = apply_repetition_penalty(logits, history, repetition_penalty)
+
+            suppress_eos = len(all_codec_ids) < min_new_tokens
+            next_token = sample_logits(
+                logits.squeeze(0),
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                suppress_mask=suppress_mask,
+                suppress_tokens=[eos_id] if suppress_eos else None,
+            )
+            next_past_hidden = hidden_states[:, -1:, :].clone()
+            talker_ready.record(stream_talker)
+
+        # while talker runs, launch predictor for next frame on stream_predictor
+        # predictor needs past_hidden and next_token — both from current frame
+        # wait for talker to finish to get them
+        stream_predictor.wait_event(talker_ready)
+
+        with torch.cuda.stream(stream_predictor):
+            last_id_hidden = talker_codec_embed(next_token.unsqueeze(1))
+            pred_input = torch.cat((next_past_hidden, last_id_hidden), dim=1)
+            codebook_token_ids = predictor_graph.run(pred_input)
+            pred_ready.record(stream_predictor)
+
+        # advance state
+        token = next_token
+        past_hidden = next_past_hidden
         gen_step += 1
-    
+
     torch.cuda.synchronize()
     t_decode = time.time() - t_decode_start
     

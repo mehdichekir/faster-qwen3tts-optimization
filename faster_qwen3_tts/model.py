@@ -815,7 +815,6 @@ class FasterQwen3TTS:
             config=config,
             predictor_graph=self.predictor_graph,
             talker_graph=self.talker_graph,
-            ref_codes=ref_codes,  # <-- add this
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             temperature=temperature,

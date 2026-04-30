@@ -153,24 +153,24 @@ def fast_generate(
     t_decode_start = time.time()
     all_codec_ids = []
     
-for step_idx in range(max_new_tokens):
-    if token.item() == eos_id:
-        break
-    
-    # --- CUDA-Graphed Code Predictor ---
-    # --- CUDA-Graphed Code Predictor (partial) ---
-    last_id_hidden = talker_codec_embed(token.unsqueeze(1))
-    pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-    codebook_token_ids = predictor_graph.run(pred_input)  # [15] full run for now
+    for step_idx in range(max_new_tokens):
+        if token.item() == eos_id:
+            break
+        
+        # --- CUDA-Graphed Code Predictor ---
+# --- CUDA-Graphed Code Predictor (partial) ---
+        last_id_hidden = talker_codec_embed(token.unsqueeze(1))
+        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+        codebook_token_ids = predictor_graph.run(pred_input)  # [15] full run for now
 
-    if ref_upper is not None:
-        # find nearest ref frame by matching codebook 1
-        pred_cb1 = codebook_token_ids[0]
-        dists = (ref_cb1 - pred_cb1).abs()
-        nearest = dists.argmin()
-        # steal upper codes 5-15 from that ref frame
-        codebook_token_ids = codebook_token_ids.clone()
-        codebook_token_ids[4:] = ref_upper[nearest]
+        if ref_upper is not None:
+            # find nearest ref frame by matching codebook 1
+            pred_cb1 = codebook_token_ids[0]
+            dists = (ref_cb1 - pred_cb1).abs()
+            nearest = dists.argmin()
+            # steal upper codes 5-15 from that ref frame
+            codebook_token_ids = codebook_token_ids.clone()
+            codebook_token_ids[4:] = ref_upper[nearest]
         
         # Build full codec: [first_cb, cb1, ..., cb15]
         all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]

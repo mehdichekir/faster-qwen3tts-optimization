@@ -42,7 +42,7 @@ class PredictorGraph:
         self.num_layers = pred_config.num_hidden_layers
         self.hidden_size = pred_config.hidden_size
         self.num_code_groups = pred_config.num_code_groups
-        self.num_codebooks = self.num_code_groups - 1  # 15
+        self.num_codebooks = 4  # 15
         self.max_seq = 2 + self.num_codebooks  # 17
         self.do_sample = do_sample
         self.top_k = top_k
